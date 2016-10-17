@@ -3,22 +3,70 @@
 #include <iostream>
 #include <locale>
 #include <codecvt>
+#include <algorithm>
+#include <type_traits>
 class utf8_streambuf : public std::streambuf {
 private:
 	using Traits = traits_type;
 	using wtraits = std::char_traits<wchar_t>;
-	std::wstreambuf *is_ptr;
-	std::wostream *os_ptr;
+	std::wstreambuf *s_buf_ptr;
 	std::string read_buf;//utf-8 buffer
 	std::string write_buf;
-	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> wcvt;
-	enum class mode { unused, read, write } mode;
+	using wcvt_t = std::wstring_convert<typename std::conditional<sizeof(wchar_t) == 2, std::codecvt_utf8_utf16<wchar_t>, std::codecvt_utf8<wchar_t>>::type>;
+	wcvt_t wcvt;
+	wchar_t read_surrogate_pairs_buf;
+	enum class mode { writeable, read };
+	enum class mode mode;
+private:
+	void change_mode(enum class mode m) {
+		constexpr std::size_t write_buffer_size = 100;
+		if (m == this->mode) return;
+		if (m == mode::read) {
+			this->setp(nullptr, nullptr);//update write ptr
+		}
+		else {
+			std::size_t front_pos = 0;
+			if (this->write_buf.empty()) {
+				this->write_buf.resize(write_buffer_size);
+			}
+			else {
+				front_pos = Traits::length(this->write_buf.c_str());
+				if (this->write_buf.size() < write_buffer_size) {
+					this->write_buf.resize(write_buffer_size);
+				}
+			}
+			this->setp(&this->write_buf[front_pos], &this->write_buf[this->write_buf.length()]);//update write ptr
+		}
+		this->mode = m;
+	}
 public:
 	utf8_streambuf(std::wstreambuf *pStream)
-		: is_ptr(pStream), os_ptr(), read_buf(), write_buf(1000, ' '), wcvt(), mode(mode::unused)
+		: s_buf_ptr(pStream), read_buf(), write_buf(100, ' '), wcvt(), read_surrogate_pairs_buf(), mode(mode::read)
 	{
-		//this->setg(&read_buf[0], &read_buf[0], &read_buf[read_buf.length()]);//update read ptr
-		this->setp(&write_buf[0], &write_buf[write_buf.length()]);//update write ptr
+		change_mode(mode::writeable);//update write ptr
+	}
+private:
+	static constexpr bool is_utf16_surrogate_pairs_first_element(wchar_t c) { return (2 == sizeof(wchar_t) && 0xD800 <= c && c <= 0xDBFF); }
+	std::wstring read_wstream_buf(std::streamsize count = 1) {
+		if (count < 0) throw std::out_of_range("utf8_streambuf");
+		std::wstring tmp;
+		//allocate
+		tmp.reserve(static_cast<std::size_t>(count + 2));
+		if (this->read_surrogate_pairs_buf) tmp = this->read_surrogate_pairs_buf;
+		tmp.resize(static_cast<std::size_t>((this->read_surrogate_pairs_buf) ? count + 1 : count));
+		//read
+		const auto read_num = this->s_buf_ptr->sgetn(&tmp[0], count);
+		if (read_num <= 0) return L"";
+		tmp.resize(static_cast<std::size_t>(read_num));
+		//get surrogate pairs 2nd element. we don't have to think about combining character.
+		if (is_utf16_surrogate_pairs_first_element(tmp.back())) {
+			if (wtraits::eq_int_type(wtraits::eof(), this->sgetc())) {
+				this->read_surrogate_pairs_buf = tmp.back();
+				tmp.pop_back();
+			}
+			tmp += wtraits::to_char_type(this->sbumpc());
+		}
+		return tmp;
 	}
 protected:
 	//this->eback() : 1st argument of this->setg()
@@ -28,83 +76,97 @@ protected:
 	// get a character from stream, but don't point past it
 	//The public functions of std::streambuf call this function only if gptr() == nullptr or gptr() >= egptr().
 	virtual int_type underflow() override {
-		if (mode::write == this->mode) throw std::runtime_error("utf8_streambuf");
+		change_mode(mode::read);
 
 		//check buffer
-		if (read_buf.empty()) {
+		if (this->read_buf.empty()) {
 			//read
 			const auto tmp = this->read_wstream_buf();
 			if (tmp.empty())  return Traits::eof();
 			this->mode = mode::read;
 			//convert
-			read_buf = this->wcvt.to_bytes(tmp);//move
-			if (read_buf.empty()) return 0;
+			this->read_buf = this->wcvt.to_bytes(tmp);//move
+			if (this->read_buf.empty()) return 0;
 		}
 		return Traits::to_int_type(read_buf.front());
 	}
 	virtual int_type uflow() override {
 		const auto re = this->underflow();
-		read_buf.erase(0, 1);
-		if (read_buf.empty()) this->mode = mode::unused;
+		this->read_buf.erase(0, 1);
+		if (this->read_buf.empty()) change_mode(mode::writeable);
 		return re;
 	}
 	// put a character back to stream
 	virtual int_type pbackfail(int_type c = Traits::eof()) override {
-		if (mode::write == this->mode) throw std::runtime_error("utf8_streambuf");
+		change_mode(mode::read);
 		if (c != Traits::eof()) {
-			read_buf.insert(read_buf.begin(), c);
+			this->read_buf.insert(this->read_buf.begin(), c);
 			this->mode = mode::read;
 		}
 		return c;
 	}
 	virtual std::streamsize xsgetn(char_type* s, std::streamsize count) override {
-		if (mode::write == this->mode) throw std::runtime_error("utf8_streambuf");
+		change_mode(mode::read);
 		if (count <= 0) return count;
 
-		if (read_buf.empty()) {
+		if (this->read_buf.empty()) {
 			//read
 			const auto tmp = this->read_wstream_buf(count);
 			if (tmp.empty()) return 0;
 			//convert
-			read_buf = this->wcvt.to_bytes(tmp);//move
-			if (read_buf.empty()) return 0;
+			this->read_buf = this->wcvt.to_bytes(tmp);//move
+			if (this->read_buf.empty()) return 0;
 		}
-		else if (read_buf.size() < static_cast<std::size_t>(count)) {
+		else if (this->read_buf.size() < static_cast<std::size_t>(count)) {
 			//read
 			const auto tmp = this->read_wstream_buf(count - static_cast<std::streamsize>(read_buf.size()));
 			//convert
-			if (tmp.empty()) read_buf += this->wcvt.to_bytes(tmp);//copy back
+			if (tmp.empty()) this->read_buf += this->wcvt.to_bytes(tmp);//copy back
 		}
-		const bool need_buf_erase = (static_cast<std::size_t>(count) < read_buf.size());
-		const auto output_size = (!need_buf_erase) ? read_buf.size() : static_cast<std::size_t>(count);
-		memcpy(s, read_buf.c_str(), output_size);
+		const bool need_buf_erase = (static_cast<std::size_t>(count) < this->read_buf.size());
+		const auto output_size = (!need_buf_erase) ? this->read_buf.size() : static_cast<std::size_t>(count);
+		memcpy(s, this->read_buf.c_str(), output_size);
 		if (need_buf_erase) {
-			read_buf.erase(0, output_size);
-			this->mode = mode::read;
+			this->read_buf.erase(0, output_size);
 		}
 		else {
-			read_buf.clear();
-			this->mode = mode::unused;
+			this->read_buf.clear();
+			change_mode(mode::writeable);
 		}
 		return 0;
 	}
 private:
-	static constexpr bool is_utf16_surrogate_pairs_first_element(wchar_t c) { return (2 == sizeof(wchar_t) && 0xD800 <= c && c <= 0xDBFF); }
-	std::wstring read_wstream_buf(std::streamsize count = 1) {
-		if (count < 0) throw std::out_of_range("utf8_streambuf");
-		std::wstring tmp;
-		//allocate
-		tmp.reserve(static_cast<std::size_t>(count + 1));
-		tmp.resize(static_cast<std::size_t>(count));
-		//read
-		const auto read_num = is_ptr->sgetn(&tmp[0], count);
-		if (read_num <= 0) return L"";
-		tmp.resize(static_cast<std::size_t>(read_num));
-		//get surrogate pairs 2nd element. we don't have to think about combining character.
-		if (is_utf16_surrogate_pairs_first_element(tmp.back())) {
-			tmp += wtraits::to_char_type(this->sbumpc());
+	static std::size_t how_many_utf8_byte_from_last_is_broken(const std::string& s) {
+		//                     byte per codepoint :    2     3     4     5     6
+		//                         rest charactor :    1     2     3     4     5
+		static constexpr std::uint8_t mask_list[] = { 0xE0, 0xF0, 0xF8, 0xFC, 0xFE };
+		static constexpr std::uint8_t comp_list[] = { 0xC0, 0xE0, 0xF0, 0xF8, 0xFC };
+		static_assert(sizeof(mask_list) == sizeof(comp_list), "error");
+
+		if (s.empty()) return 0;
+		const auto iterate_num = std::min(s.size(), sizeof(mask_list) / sizeof(std::uint8_t));
+		std::size_t i = 0;
+		for (auto rit = s.rbegin(); i < iterate_num; ++i, ++rit) {
+			for (std::size_t j = i; j < sizeof(mask_list) / sizeof(std::uint8_t); ++j) {
+				if (comp_list[j] == (static_cast<std::uint8_t>(*rit) & mask_list[j])) return i + 1;
+			}
 		}
-		return tmp;
+		return 0;
+	}
+	void write_wstream_buf(bool rest_delete_flg = false){
+		change_mode(mode::writeable);
+		if (this->write_buf.empty()) return;
+		const auto rest_size = how_many_utf8_byte_from_last_is_broken(this->write_buf);
+		const auto buf_size = this->write_buf.size();
+		if (buf_size == rest_size) return;
+		const auto rest_front_pos = buf_size - rest_size - 1;
+		auto tmp = std::move(this->write_buf);
+		if (!rest_delete_flg) {
+			this->write_buf = tmp.substr(rest_front_pos);
+		}
+		tmp.erase(rest_front_pos);
+		const auto converted = this->wcvt.from_bytes(tmp);
+		this->s_buf_ptr->sputn(converted.c_str(), static_cast<std::streamsize>(converted.size()));
 	}
 protected:
 	//The sputc() and sputn() call this function in case of an overflow (pptr() == nullptr or pptr() >= epptr()).
