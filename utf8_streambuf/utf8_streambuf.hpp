@@ -5,6 +5,131 @@
 #include <codecvt>
 #include <algorithm>
 #include <type_traits>
+class u8istreambuf : public std::streambuf {
+private:
+	using Traits = traits_type;
+	using wtraits = std::char_traits<wchar_t>;
+	std::wstreambuf *s_buf_ptr;
+	std::string buf;
+	using wcvt_t = std::wstring_convert<typename std::conditional<sizeof(wchar_t) == 2, std::codecvt_utf8_utf16<wchar_t>, std::codecvt_utf8<wchar_t>>::type>;
+	wchar_t read_surrogate_pairs_buf;
+public:
+	u8istreambuf() = delete;
+	u8istreambuf(const u8istreambuf&) = delete;
+	u8istreambuf(u8istreambuf&&) = delete;
+	u8istreambuf& operator=(const u8istreambuf&) = delete;
+	u8istreambuf& operator=(u8istreambuf&&) = delete;
+	u8istreambuf(std::wstreambuf* s_ptr)
+		: s_buf_ptr(s_ptr), buf(), read_surrogate_pairs_buf()
+	{
+		if (nullptr == this->s_buf_ptr) throw std::invalid_argument("wstreambuf is not bound.");
+	}
+private:
+	static constexpr bool is_utf16_surrogate_pairs_first_element(wchar_t c) { return (2 == sizeof(wchar_t) && 0xD800 <= c && c <= 0xDBFF); }
+	static std::string w2u8(const std::wstring& s) {
+		static thread_local wcvt_t wcvt;
+		return wcvt.to_bytes(s);
+	}
+	std::wstring read_wstream_buf(std::streamsize count = 1) {
+		if (count < 0) throw std::out_of_range("utf8_streambuf");
+
+		std::wstring tmp;
+
+		//allocate
+		tmp.reserve(static_cast<std::size_t>(count + 2));
+		if (this->read_surrogate_pairs_buf) tmp = this->read_surrogate_pairs_buf;
+		tmp.resize(static_cast<std::size_t>((this->read_surrogate_pairs_buf) ? count + 1 : count));
+		//read
+		const auto read_num = this->s_buf_ptr->sgetn(&tmp[0], count);
+		if (read_num <= 0) return L"";
+		tmp.resize(static_cast<std::size_t>(read_num));
+		//get surrogate pairs 2nd element. we don't have to think about combining character.
+		if (is_utf16_surrogate_pairs_first_element(tmp.back())) {
+			if (wtraits::eq_int_type(wtraits::eof(), this->sgetc())) {
+				this->read_surrogate_pairs_buf = tmp.back();
+				tmp.pop_back();
+			}
+			tmp += wtraits::to_char_type(this->sbumpc());
+		}
+		return tmp;
+	}
+protected:
+	//virtual void setg(char* eb, char* g, char *eg);
+	//this->eback() : 1st argument of this->setg()
+	//this->gptr()  : 2nd argument of this->setg()
+	//this->egptr() : 3rd argument of this->setg()
+
+	// get a character from stream, but don't point past it
+	//The public functions of std::streambuf call this function only if gptr() == nullptr or gptr() >= egptr().
+	virtual int_type underflow() override {
+		//check buffer
+		if (this->buf.empty()) {
+			//read
+			const auto tmp = this->read_wstream_buf();
+			if (tmp.empty())  return Traits::eof();
+			//convert
+			this->buf = w2u8(tmp);//move
+			if (this->buf.empty()) return 0;
+		}
+		return Traits::to_int_type(buf.front());
+	}
+	virtual int_type uflow() override {
+		const auto re = this->underflow();
+		this->buf.erase(0, 1);
+		return re;
+	}
+	// put a character back to stream
+	virtual int_type pbackfail(int_type c = Traits::eof()) override {
+		if (c != Traits::eof()) {
+			this->buf.insert(this->buf.begin(), c);
+		}
+		return c;
+	}
+	virtual std::streamsize xsgetn(char_type* s, std::streamsize count) override {
+		if (count <= 0) return count;
+
+		if (this->buf.empty()) {
+			//read
+			const auto tmp = this->read_wstream_buf(count);
+			if (tmp.empty()) return 0;
+			//convert
+			this->buf = w2u8(tmp);//move
+			if (this->buf.empty()) return 0;
+		}
+		else if (this->buf.size() < static_cast<std::size_t>(count)) {
+			//read
+			const auto tmp = this->read_wstream_buf(count - static_cast<std::streamsize>(buf.size()));
+			//convert
+			if (tmp.empty()) this->buf += w2u8(tmp);//copy back
+		}
+		const bool need_buf_erase = (static_cast<std::size_t>(count) < this->buf.size());
+		const auto output_size = (!need_buf_erase) ? this->buf.size() : static_cast<std::size_t>(count);
+		memcpy(s, this->buf.c_str(), output_size);
+		if (need_buf_erase) {
+			this->buf.erase(0, output_size);
+		}
+		else {
+			this->buf.clear();
+		}
+		return 0;
+	}
+	virtual int_type overflow(int_type _Meta = Traits::eof()) override {
+		throw std::runtime_error("u8istreambuf : output is not supported.");
+	}
+	virtual pos_type seekoff(
+		off_type /*off*/, std::ios_base::seekdir /*dir*/,
+		std::ios_base::openmode /*which*/ = std::ios_base::in | std::ios_base::out
+	) override {
+		return pos_type(-1);	// always fail
+	}
+	virtual pos_type seekpos(
+		pos_type pos,
+		std::ios_base::openmode which = std::ios_base::in | std::ios_base::out
+	) override {
+		//return this->seekoff(off_type(pos), std::ios_base::beg, which);
+		return pos_type(-1);	// always fail
+	}
+};
 class utf8_streambuf : public std::streambuf {
 private:
 	using Traits = traits_type;
