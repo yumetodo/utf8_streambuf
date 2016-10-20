@@ -7,5 +7,8 @@ int main() {
 	auto tmp2 = std::cin.rdbuf(&buf2);
 	int a;
 	std::cin >> a;
-	std::cout << a << u8"ありきたりな世界" << std::endl;
+	std::cout
+		<< a << std::endl
+		<< u8"ありきたりな世界" << std::endl;
+	std::cout << u8"𠮷野家" << std::endl;//CP932に変換できないのでVSのstd::wcoutの実装ではこの一行まるごと出力されない
 }
