@@ -5,7 +5,7 @@
 #include <codecvt>
 #include <algorithm>
 #include <type_traits>
-class u8istreambuf : public std::streambuf {
+class u8istreambuf final : public std::streambuf {
 private:
 	using Traits = traits_type;
 	using wtraits = std::char_traits<wchar_t>;
@@ -115,6 +115,102 @@ protected:
 	}
 	virtual int_type overflow(int_type _Meta = Traits::eof()) override {
 		throw std::runtime_error("u8istreambuf : output is not supported.");
+	}
+	virtual pos_type seekoff(
+		off_type /*off*/, std::ios_base::seekdir /*dir*/,
+		std::ios_base::openmode /*which*/ = std::ios_base::in | std::ios_base::out
+	) override {
+		return pos_type(-1);	// always fail
+	}
+	virtual pos_type seekpos(
+		pos_type pos,
+		std::ios_base::openmode which = std::ios_base::in | std::ios_base::out
+	) override {
+		//return this->seekoff(off_type(pos), std::ios_base::beg, which);
+		return pos_type(-1);	// always fail
+	}
+};
+class u8ostreambuf final : public std::streambuf {
+private:
+	using Traits = traits_type;
+	using wtraits = std::char_traits<wchar_t>;
+	std::wstreambuf *s_buf_ptr;
+	std::string buf;
+	using wcvt_t = std::wstring_convert<typename std::conditional<sizeof(wchar_t) == 2, std::codecvt_utf8_utf16<wchar_t>, std::codecvt_utf8<wchar_t>>::type>;
+public:
+	u8ostreambuf() = delete;
+	u8ostreambuf(const u8ostreambuf&) = delete;
+	u8ostreambuf(u8ostreambuf&&) = delete;
+	u8ostreambuf& operator=(const u8ostreambuf&) = delete;
+	u8ostreambuf& operator=(u8ostreambuf&&) = delete;
+	u8ostreambuf(std::wstreambuf* s_ptr)
+		: s_buf_ptr(s_ptr), buf()
+	{
+		if (nullptr == this->s_buf_ptr) throw std::invalid_argument("wstreambuf is not bound.");
+		this->buf.reserve(120);
+		this->buf.resize(100);
+		this->setp(&buf[0], &buf.back());
+	}
+private:
+	static std::wstring u82w(const std::string& s) {
+		static thread_local wcvt_t wcvt;
+		return wcvt.from_bytes(s);
+	}
+	static std::size_t how_many_utf8_byte_from_last_is_broken(const std::string& s) {
+		//                     byte per codepoint :    2     3     4     5     6
+		//                         rest charactor :    1     2     3     4     5
+		static constexpr std::uint8_t mask_list[] = { 0xE0, 0xF0, 0xF8, 0xFC, 0xFE };
+		static constexpr std::uint8_t comp_list[] = { 0xC0, 0xE0, 0xF0, 0xF8, 0xFC };
+		static_assert(sizeof(mask_list) == sizeof(comp_list), "error");
+
+		if (s.empty()) return 0;
+		const auto iterate_num = std::min(s.size(), sizeof(mask_list) / sizeof(std::uint8_t));
+		std::size_t i = 0;
+		for (auto rit = s.rbegin(); i < iterate_num; ++i, ++rit) {
+			for (std::size_t j = i; j < sizeof(mask_list) / sizeof(std::uint8_t); ++j) {
+				if (comp_list[j] == (static_cast<std::uint8_t>(*rit) & mask_list[j])) return i + 1;
+			}
+		}
+		return 0;
+	}
+	bool write_wstream_buf(bool rest_delete_flg = false) {
+		if (this->buf.empty()) {
+			this->buf.resize(100);
+			this->setp(&this->buf[0], &this->buf.back());
+			return true;
+		}
+		const auto rest_size = how_many_utf8_byte_from_last_is_broken(this->buf);
+		const auto buf_size = this->buf.size();
+		if (buf_size == rest_size) return true;
+		const auto rest_front_pos = buf_size - rest_size;
+		auto tmp = std::move(this->buf);
+		this->buf.resize(100);
+		if (!rest_delete_flg) {
+			std::copy(tmp.begin() + rest_front_pos, tmp.end(), this->buf.begin());
+			this->setp(&this->buf[rest_size], &this->buf.back());
+		}
+		else {
+			this->setp(&this->buf[0], &this->buf.back());
+		}
+		tmp.erase(rest_front_pos);
+		const auto converted = u82w(tmp);
+		const auto size = static_cast<std::streamsize>(converted.size());
+		return size == this->s_buf_ptr->sputn(converted.c_str(), size);
+	}
+protected:
+	//virtual void setp(char* p, char* ep);
+	//this->pbase() : 1st argument of this->setg()
+	//this->epptr()  : 2nd argument of this->setg()
+
+	//The sputc() and sputn() call this function in case of an overflow (pptr() == nullptr or pptr() >= epptr()).
+	virtual int_type overflow(int_type _Meta = Traits::eof()) override {
+		return write_wstream_buf() ? 0 : Traits::eof();
+	}
+	virtual int sync() override {
+		this->buf.resize(Traits::length(this->buf.c_str()));
+		const auto re =  write_wstream_buf(true) ? 0 : -1;
+		this->s_buf_ptr->pubsync();
+		return re;
 	}
 	virtual pos_type seekoff(
 		off_type /*off*/, std::ios_base::seekdir /*dir*/,
